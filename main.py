@@ -24,9 +24,8 @@ TARGET_CHAT = -1004320100002
 MIN_FILE_SIZE_MB = 50
 seen_messages = set()
 
-# Dummy web server keep-alive ke liye
 async def handle_ping(request):
-    return web.Response(text="Movie Forwarder Bot is Live!")
+    return web.Response(text="Bot is running!")
 
 async def start_web_server():
     server = web.Application()
@@ -36,32 +35,36 @@ async def start_web_server():
     port = int(os.getenv("PORT", 10000))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    logging.info(f"Keep-alive web server started on port {port}")
 
 async def process_and_forward(client, target, msg, bot_label="Bot"):
     if not msg:
         return False
 
-    # Unique message identifier
     msg_key = f"{msg.chat_id}_{msg.id}"
     if msg_key in seen_messages:
         return False
 
-    # Media aur file size check
-    if not msg.media or not getattr(msg, "file", None):
+    # Debug details
+    has_media = bool(msg.media)
+    file_obj = getattr(msg, "file", None)
+    text_preview = (msg.text or "").replace("\n", " ")[:60]
+    logging.info(f"[{bot_label}] Processing Msg ID {msg.id} | Has Media: {has_media} | Text: '{text_preview}'")
+
+    # Agar media nahi hai
+    if not has_media or not file_obj:
+        logging.info(f"[{bot_label}] Skipped Msg ID {msg.id}: Media file nahi mili (Sirf text/button message hai).")
         return False
 
-    size_bytes = getattr(msg.file, "size", 0) or 0
+    size_bytes = getattr(file_obj, "size", 0) or 0
     size_mb = size_bytes / (1024 * 1024)
-    file_name = getattr(msg.file, "name", None) or f"media_{msg.id}"
+    file_name = getattr(file_obj, "name", None) or f"file_{msg.id}"
 
-    logging.info(f"[{bot_label}] Media Found: '{file_name}' | Size: {size_mb:.2f} MB")
+    logging.info(f"[{bot_label}] File Found: '{file_name}' | Size: {size_mb:.2f} MB")
 
     if size_mb < MIN_FILE_SIZE_MB:
-        logging.info(f"[{bot_label}] Skipped: {size_mb:.2f} MB is less than {MIN_FILE_SIZE_MB} MB.")
+        logging.info(f"[{bot_label}] Skipped Msg ID {msg.id}: Size ({size_mb:.2f} MB) < {MIN_FILE_SIZE_MB} MB limit.")
         return False
 
-    # Native forward attempt
     attempts = 0
     while attempts < 3:
         try:
@@ -71,12 +74,10 @@ async def process_and_forward(client, target, msg, bot_label="Bot"):
             await asyncio.sleep(2)
             return True
         except FloodWaitError as e:
-            wait_time = e.seconds + 2
-            logging.warning(f"FloodWait: Waiting {wait_time}s...")
-            await asyncio.sleep(wait_time)
+            await asyncio.sleep(e.seconds + 2)
             attempts += 1
         except Exception as e:
-            logging.error(f"Failed to forward message {msg.id}: {e}")
+            logging.error(f"Error forwarding Msg {msg.id}: {e}")
             attempts += 1
             await asyncio.sleep(2)
 
@@ -96,36 +97,24 @@ async def main():
 
     target = await client.get_entity(TARGET_CHAT)
 
-    # Resolve bot entities & IDs
-    bot_entities = []
     bot_ids = set()
     for username in SOURCE_BOTS:
         try:
             entity = await client.get_entity(username)
-            bot_entities.append(entity)
             bot_ids.add(entity.id)
             logging.info(f"Resolved bot: @{username} (ID: {entity.id})")
         except Exception as e:
             logging.error(f"Could not resolve @{username}: {e}")
 
-    # Startup sync: Dono bots ke last 3 messages check karo
-    logging.info("Syncing recent messages from bots on startup...")
-    for entity in bot_entities:
-        b_name = getattr(entity, "username", str(entity.id))
-        async for message in client.iter_messages(entity, limit=3):
-            await process_and_forward(client, target, message, f"@{b_name}")
-
-    # Global Listener (No rigid event filters)
     @client.on(events.NewMessage)
     async def incoming_handler(event):
         sender_id = event.sender_id
         chat_id = event.chat_id
 
-        # Check karo agar message target bots mein se kisi ka hai
         if chat_id in bot_ids or sender_id in bot_ids:
             sender = await event.get_sender()
             bot_name = getattr(sender, "username", str(chat_id))
-            logging.info(f"[TRIGGER] New message incoming from @{bot_name} (Chat: {chat_id})")
+            logging.info(f"[TRIGGER] New message from @{bot_name} (Chat: {chat_id}, Msg ID: {event.id})")
             await process_and_forward(client, target, event.message, f"@{bot_name}")
 
     logging.info(">>> BOT LISTENER ACTIVE: WAITING FOR MOVIES <<<")
