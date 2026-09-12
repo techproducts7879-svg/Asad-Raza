@@ -6,7 +6,15 @@ from aiohttp import web
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError
+from telethon.tl.types import (
+    MessageMediaDocument,
+    MessageMediaPhoto,
+)
 
+
+# =========================================================
+# LOGGING
+# =========================================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -14,9 +22,13 @@ logging.basicConfig(
 )
 
 
-API_ID = int(os.getenv("API_ID"))
-API_HASH = os.getenv("API_HASH")
-SESSION_STRING = os.getenv("SESSION_STRING")
+# =========================================================
+# CONFIG
+# =========================================================
+
+API_ID = int(os.getenv("API_ID", "0"))
+API_HASH = os.getenv("API_HASH", "")
+SESSION_STRING = os.getenv("SESSION_STRING", "")
 
 SOURCE_CHAT_ID = -1002405808647
 TARGET_CHAT_ID = -1004320100002
@@ -26,16 +38,18 @@ MIN_FILE_SIZE_MB = 10
 seen_messages = set()
 
 
-# --------------------------------------------------
+# =========================================================
 # KEEP ALIVE SERVER
-# --------------------------------------------------
+# =========================================================
 
 async def handle_ping(request):
     return web.Response(text="Bot active and listening!")
 
 
 async def start_web_server():
+
     app = web.Application()
+
     app.router.add_get("/", handle_ping)
 
     runner = web.AppRunner(app)
@@ -52,15 +66,78 @@ async def start_web_server():
     await site.start()
 
     logging.info(
-        f"Keep-alive web server active on port {port}"
+        f"[WEB] Keep-alive server running on port {port}"
     )
 
 
-# --------------------------------------------------
-# PROCESS MESSAGE
-# --------------------------------------------------
+# =========================================================
+# MEDIA INFORMATION
+# =========================================================
 
-async def process_and_forward(client, target_entity, msg):
+def get_media_info(msg):
+
+    media = getattr(msg, "media", None)
+
+    if not media:
+        return None
+
+    # Telegram document
+    if isinstance(media, MessageMediaDocument):
+
+        document = getattr(media, "document", None)
+
+        if not document:
+            return None
+
+        size = getattr(document, "size", 0) or 0
+
+        attributes = getattr(document, "attributes", []) or []
+
+        file_name = None
+        is_video = False
+
+        for attribute in attributes:
+
+            # Document filename
+            if hasattr(attribute, "file_name"):
+                file_name = attribute.file_name
+
+            # Video attribute
+            if attribute.__class__.__name__ == "DocumentAttributeVideo":
+                is_video = True
+
+        if not file_name:
+            file_name = f"media_{msg.id}"
+
+        return {
+            "type": "document",
+            "size": size,
+            "name": file_name,
+            "is_video": is_video,
+        }
+
+    # Telegram photo
+    if isinstance(media, MessageMediaPhoto):
+
+        return {
+            "type": "photo",
+            "size": 0,
+            "name": f"photo_{msg.id}",
+            "is_video": False,
+        }
+
+    return None
+
+
+# =========================================================
+# PROCESS + FORWARD
+# =========================================================
+
+async def process_and_forward(
+    client,
+    target_entity,
+    msg
+):
 
     if not msg:
         return False
@@ -68,108 +145,104 @@ async def process_and_forward(client, target_entity, msg):
     msg_key = f"{msg.chat_id}_{msg.id}"
 
     if msg_key in seen_messages:
+
         logging.info(
             f"[DUPLICATE] Message {msg.id} already processed."
         )
+
         return False
 
-    # ----------------------------------------------
-    # CHECK MEDIA
-    # ----------------------------------------------
+    # -----------------------------------------------------
+    # MEDIA
+    # -----------------------------------------------------
 
-    if not msg.media:
+    media_info = get_media_info(msg)
+
+    if not media_info:
+
         logging.info(
-            f"[SKIPPED] Message {msg.id} has no media."
+            f"[SKIPPED] Message {msg.id} "
+            f"has no supported media."
         )
+
         return False
 
-    file_obj = getattr(msg, "file", None)
+    file_name = media_info["name"]
+    size_bytes = media_info["size"]
+    media_type = media_info["type"]
 
-    if not file_obj:
-        logging.info(
-            f"[SKIPPED] Message {msg.id} media has no file object."
-        )
-        return False
+    # -----------------------------------------------------
+    # SIZE
+    # -----------------------------------------------------
 
-    # ----------------------------------------------
-    # FILE SIZE
-    # ----------------------------------------------
+    if size_bytes:
 
-    size_bytes = getattr(file_obj, "size", None)
+        size_mb = size_bytes / (1024 * 1024)
 
-    if not size_bytes:
-        logging.warning(
-            f"[SKIPPED] Message {msg.id}: unable to determine file size."
-        )
-        return False
+    else:
 
-    size_mb = size_bytes / (1024 * 1024)
-
-    file_name = (
-        getattr(file_obj, "name", None)
-        or f"media_{msg.id}"
-    )
+        size_mb = 0
 
     logging.info(
-        f"[MEDIA] ID={msg.id} "
+        f"[MEDIA DETECTED] "
+        f"ID={msg.id} "
+        f"Type={media_type} "
         f"Name='{file_name}' "
         f"Size={size_mb:.2f} MB"
     )
 
-    # ----------------------------------------------
+    # -----------------------------------------------------
     # SIZE FILTER
-    # ----------------------------------------------
+    # -----------------------------------------------------
 
-    if size_mb < MIN_FILE_SIZE_MB:
+    if size_bytes and size_mb < MIN_FILE_SIZE_MB:
 
         logging.info(
-            f"[SKIPPED] {file_name} "
-            f"is below {MIN_FILE_SIZE_MB} MB."
+            f"[SKIPPED] '{file_name}' "
+            f"is only {size_mb:.2f} MB "
+            f"(minimum {MIN_FILE_SIZE_MB} MB)."
         )
 
         return False
 
-    # ----------------------------------------------
+    # -----------------------------------------------------
     # FORWARD
-    # ----------------------------------------------
+    # -----------------------------------------------------
 
     for attempt in range(1, 4):
 
         try:
 
             logging.info(
-                f"[FORWARD] Attempt {attempt}/3 "
-                f"for message {msg.id}"
+                f"[FORWARD] Message {msg.id} "
+                f"attempt {attempt}/3"
             )
 
             result = await client.forward_messages(
-                target_entity,
-                msg
+                entity=target_entity,
+                messages=msg
             )
 
             seen_messages.add(msg_key)
 
             logging.info(
-                f"[SUCCESS] Message {msg.id} "
-                f"forwarded successfully."
-            )
-
-            logging.info(
-                f"[TARGET RESULT] {result}"
+                f"[SUCCESS] '{file_name}' "
+                f"successfully forwarded "
+                f"to target."
             )
 
             return True
 
         except FloodWaitError as e:
 
-            wait_time = e.seconds + 2
+            wait_seconds = e.seconds + 2
 
             logging.warning(
-                f"[FLOOD WAIT] Telegram requested "
-                f"{wait_time}s wait."
+                f"[FLOOD WAIT] Telegram requires "
+                f"{wait_seconds}s."
             )
 
-            await asyncio.sleep(wait_time)
+            await asyncio.sleep(wait_seconds)
 
         except Exception as e:
 
@@ -181,36 +254,43 @@ async def process_and_forward(client, target_entity, msg):
             await asyncio.sleep(2)
 
     logging.error(
-        f"[FAILED] Could not forward message {msg.id}"
+        f"[FAILED] Message {msg.id} "
+        f"could not be forwarded."
     )
 
     return False
 
 
-# --------------------------------------------------
+# =========================================================
 # MAIN
-# --------------------------------------------------
+# =========================================================
 
 async def main():
 
     await start_web_server()
 
-    # ----------------------------------------------
-    # VALIDATE ENVIRONMENT
-    # ----------------------------------------------
+    # -----------------------------------------------------
+    # ENVIRONMENT CHECK
+    # -----------------------------------------------------
 
     if not API_ID:
-        raise RuntimeError("API_ID is missing.")
+        raise RuntimeError(
+            "API_ID environment variable is missing."
+        )
 
     if not API_HASH:
-        raise RuntimeError("API_HASH is missing.")
+        raise RuntimeError(
+            "API_HASH environment variable is missing."
+        )
 
     if not SESSION_STRING:
-        raise RuntimeError("SESSION_STRING is missing.")
+        raise RuntimeError(
+            "SESSION_STRING environment variable is missing."
+        )
 
-    # ----------------------------------------------
+    # -----------------------------------------------------
     # TELEGRAM CLIENT
-    # ----------------------------------------------
+    # -----------------------------------------------------
 
     client = TelegramClient(
         StringSession(SESSION_STRING),
@@ -221,12 +301,12 @@ async def main():
     await client.start()
 
     logging.info(
-        "[TELEGRAM] Client connected successfully."
+        "[TELEGRAM] Client connected."
     )
 
-    # ----------------------------------------------
-    # RESOLVE SOURCE
-    # ----------------------------------------------
+    # -----------------------------------------------------
+    # SOURCE
+    # -----------------------------------------------------
 
     try:
 
@@ -246,15 +326,15 @@ async def main():
     except Exception:
 
         logging.exception(
-            "[SOURCE] Could not resolve source chat."
+            "[SOURCE] Could not resolve source."
         )
 
         await client.disconnect()
         return
 
-    # ----------------------------------------------
-    # RESOLVE TARGET
-    # ----------------------------------------------
+    # -----------------------------------------------------
+    # TARGET
+    # -----------------------------------------------------
 
     try:
 
@@ -274,32 +354,18 @@ async def main():
     except Exception:
 
         logging.exception(
-            "[TARGET] Could not resolve target chat."
+            "[TARGET] Could not resolve target."
         )
 
         await client.disconnect()
         return
 
-    # ----------------------------------------------
-    # VERIFY ACCESS
-    # ----------------------------------------------
+    # -----------------------------------------------------
+    # STARTUP SCAN
+    # -----------------------------------------------------
 
     logging.info(
-        "[VERIFY] Source ID: %s",
-        getattr(source_entity, "id", "unknown")
-    )
-
-    logging.info(
-        "[VERIFY] Target ID: %s",
-        getattr(target_entity, "id", "unknown")
-    )
-
-    # ----------------------------------------------
-    # STARTUP CATCH-UP
-    # ----------------------------------------------
-
-    logging.info(
-        "[STARTUP] Checking last 10 messages..."
+        "[STARTUP] Checking latest 10 messages..."
     )
 
     try:
@@ -318,84 +384,72 @@ async def main():
     except Exception:
 
         logging.exception(
-            "[STARTUP] Message scan failed."
+            "[STARTUP] Scan failed."
         )
 
-    # ----------------------------------------------
+    # -----------------------------------------------------
     # NEW MESSAGE LISTENER
-    # ----------------------------------------------
+    # -----------------------------------------------------
 
     @client.on(events.NewMessage)
     async def channel_post_handler(event):
 
         try:
 
-            incoming_chat_id = event.chat_id
-
             logging.info(
-                "[EVENT] New message detected. "
-                f"chat_id={incoming_chat_id}, "
+                f"[EVENT] New message "
+                f"chat_id={event.chat_id} "
                 f"message_id={event.id}"
             )
 
-            # --------------------------------------
-            # ONLY SOURCE CHAT
-            # --------------------------------------
-
-            if incoming_chat_id != SOURCE_CHAT_ID:
+            # Only source channel
+            if event.chat_id != SOURCE_CHAT_ID:
 
                 logging.info(
-                    "[EVENT] Message is not from source. Ignoring."
+                    "[EVENT] Not source channel. Ignoring."
                 )
 
                 return
 
+            msg = event.message
+
             logging.info(
-                f"[SOURCE EVENT] New message {event.id}"
+                f"[SOURCE EVENT] "
+                f"Message {msg.id}"
             )
 
             await process_and_forward(
                 client,
                 target_entity,
-                event.message
+                msg
             )
 
         except Exception:
 
             logging.exception(
-                "[EVENT] Handler crashed."
+                "[EVENT] Handler error."
             )
 
-    logging.info(
-        "=============================================="
-    )
+    # -----------------------------------------------------
+    # READY
+    # -----------------------------------------------------
 
+    logging.info("=" * 60)
+    logging.info("TELEGRAM MOVIE FORWARDER IS READY")
+    logging.info(f"SOURCE: {SOURCE_CHAT_ID}")
+    logging.info(f"TARGET: {TARGET_CHAT_ID}")
     logging.info(
-        "LISTENER ACTIVE"
+        f"MINIMUM FILE SIZE: {MIN_FILE_SIZE_MB} MB"
     )
-
-    logging.info(
-        f"SOURCE: {SOURCE_CHAT_ID}"
-    )
-
-    logging.info(
-        f"TARGET: {TARGET_CHAT_ID}"
-    )
-
-    logging.info(
-        "Waiting for new Telegram messages..."
-    )
-
-    logging.info(
-        "=============================================="
-    )
+    logging.info("Waiting for new messages...")
+    logging.info("=" * 60)
 
     await client.run_until_disconnected()
 
 
-# --------------------------------------------------
+# =========================================================
 # ENTRY POINT
-# --------------------------------------------------
+# =========================================================
 
 if __name__ == "__main__":
     asyncio.run(main())
